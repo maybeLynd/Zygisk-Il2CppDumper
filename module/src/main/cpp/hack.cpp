@@ -24,34 +24,7 @@
 #include <climits>
 
 // ---- decrypted global-metadata.dat save (Digimon-NC) ------------------------------------------
-// The game decrypts global-metadata.dat into RAM during il2cpp_init; dump_metadata saves it.
-static uint32_t md_header_length(const uint8_t *h, size_t avail) {
-    if (avail < 12 || *(const uint32_t *) h != 0xFAB11BAFu) return 0;
-    int32_t version = *(const int32_t *) (h + 4);
-    if (version < 16 || version > 40) return 0;
-    int32_t hb = *(const int32_t *) (h + 8);
-    if (hb < 0x40 || hb > 0x400 || (hb - 8) % 8 != 0 || (size_t) hb > avail) return 0;
-    int64_t length = 0;
-    const int64_t max_bytes = 512LL * 1024 * 1024;
-    for (int i = 0; i < (hb - 8) / 8; i++) {
-        int32_t o = *(const int32_t *) (h + 8 + i * 8);
-        int32_t sz = *(const int32_t *) (h + 12 + i * 8);
-        if (o < 0 || sz < 0 || sz > max_bytes) return 0;
-        if (sz && o < hb) return 0;
-        if ((int64_t) o + sz > max_bytes) return 0;
-        if ((int64_t) o + sz > length) length = (int64_t) o + sz;
-    }
-    if (length < hb) return 0;
-    return (uint32_t) length;
-}
-
-static bool safe_read(const void *addr, void *buf, size_t len) {
-    // process_vm_readv on our own pid: unmapped/unreadable pages give EFAULT instead of SIGSEGV.
-    struct iovec local = {buf, len};
-    struct iovec remote = {const_cast<void *>(addr), len};
-    return syscall(__NR_process_vm_readv, getpid(), &local, 1, &remote, 1, 0) == (ssize_t) len;
-}
-
+// The game decrypts global-metadata.dat into RAM during il2cpp_init; dump_metadata reports where.
 static void write_status(const char *game_data_dir, const char *text) {
     char out[PATH_MAX];
     snprintf(out, sizeof(out), "%s/files/dumper_status.txt", game_data_dir);
@@ -63,8 +36,8 @@ static void write_status(const char *game_data_dir, const char *text) {
 }
 
 static void dump_metadata(const char *game_data_dir, void *il2cpp_handle) {
-    // IL2CPP class names point into the decrypted metadata string table. Save the contiguous readable
-    // region around that string (capped), and separately any blob in it with a valid IL2CPP header.
+    // Report the address of an il2cpp class name: it points into the decrypted metadata string table.
+    // The host script copies the mapping that contains it out of /proc/<pid>/mem (as root).
     typedef void *(*domain_get_t)();
     typedef void **(*domain_get_assemblies_t)(void *, size_t *);
     typedef void *(*assembly_get_image_t)(void *);
@@ -84,71 +57,23 @@ static void dump_metadata(const char *game_data_dir, void *il2cpp_handle) {
     }
     size_t n_asm = 0;
     void **assemblies = get_assemblies(domain_get(), &n_asm);
-    uintptr_t anchor = 0;
-    for (size_t a = 0; a < n_asm && !anchor; a++) {
+    for (size_t a = 0; a < n_asm; a++) {
         void *image = get_image(assemblies[a]);
         if (image && class_count(image) > 0) {
             void *klass = get_class(image, 0);
-            if (klass) anchor = (uintptr_t) class_name(klass);
-        }
-    }
-    if (!anchor) {
-        LOGE("metadata: no anchor string");
-        write_status(game_data_dir, "error no-anchor\n");
-        return;
-    }
-    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
-    const uintptr_t cap = 384UL * 1024 * 1024;  // per direction
-    std::vector<uint8_t> buf(page);
-    uintptr_t lo = anchor & ~(page - 1), hi = lo;
-    while (anchor - (lo - page) <= cap && safe_read((void *) (lo - page), buf.data(), page)) lo -= page;
-    while (hi - anchor <= cap && safe_read((void *) hi, buf.data(), page)) hi += page;
-    if (hi <= lo) {
-        LOGE("metadata: anchor %p not readable", (void *) anchor);
-        write_status(game_data_dir, "error anchor-unreadable\n");
-        return;
-    }
-    LOGI("metadata: region %p-%p (%zu bytes), anchor +%zu", (void *) lo, (void *) hi, (size_t) (hi - lo),
-         (size_t) (anchor - lo));
-
-    char out[PATH_MAX];
-    snprintf(out, sizeof(out), "%s/files/metadata_region_%lx_anchor_%lx.bin", game_data_dir,
-             (unsigned long) lo, (unsigned long) anchor);
-    FILE *f = fopen(out, "wb");
-    if (!f) {
-        LOGE("metadata: cannot write %s", out);
-        write_status(game_data_dir, "error cannot-write\n");
-        return;
-    }
-    int headers = 0;
-    const size_t chunk = 1 << 20;
-    std::vector<uint8_t> big(chunk + 0x400);
-    for (uintptr_t at = lo; at < hi; at += chunk) {
-        size_t n = std::min((size_t) (hi - at), chunk);
-        if (!safe_read((void *) at, big.data(), n)) {
-            LOGE("metadata: read failed at %p", (void *) at);
-            break;
-        }
-        fwrite(big.data(), 1, n, f);
-        for (size_t i = 0; i + 12 <= n; i += 4) {
-            if (*(const uint32_t *) (big.data() + i) != 0xFAB11BAFu) continue;
-            size_t avail = std::min((size_t) 0x400, (size_t) (hi - (at + i)));
-            std::vector<uint8_t> hdr(avail);
-            if (!safe_read((void *) (at + i), hdr.data(), avail)) continue;
-            uint32_t length = md_header_length(hdr.data(), avail);
-            if (length) {
-                headers++;
-                LOGI("metadata: header v%d length %u at %p", *(const int32_t *) (hdr.data() + 4), length,
-                     (void *) (at + i));
+            const char *name = klass ? class_name(klass) : nullptr;
+            if (name) {
+                char status[96];
+                snprintf(status, sizeof(status), "done anchor %lx pid %d\n", (unsigned long) (uintptr_t) name,
+                         getpid());
+                write_status(game_data_dir, status);
+                LOGI("metadata: %s", status);
+                return;
             }
         }
     }
-    fclose(f);
-    LOGI("metadata: region saved -> %s (%d valid header(s))", out, headers);
-    char status[128];
-    snprintf(status, sizeof(status), "done region %zu headers %d\n", (size_t) (hi - lo), headers);
-    write_status(game_data_dir, status);
-    LOGI("metadata: 1 candidate(s) written");
+    LOGE("metadata: no anchor string");
+    write_status(game_data_dir, "error no-anchor\n");
 }
 // -----------------------------------------------------------------------------------------------
 
