@@ -150,7 +150,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     void *nb = nullptr;
     auto native_bridge = GetNativeBridgeLibrary();
     LOGI("native bridge: %s", native_bridge.data());
-    for (const char *name : {"libhoudini.so", native_bridge.data()}) {
+    for (const char *name : {(const char *) "libhoudini.so", (const char *) native_bridge.data()}) {
         auto h = xdl_open(name, XDL_TRY_FORCE_LOAD);
         if (h && xdl_sym(h, "NativeBridgeItf", nullptr)) { nb = h; LOGI("using %s", name); break; }
     }
