@@ -115,10 +115,16 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     //TODO 等待houdini初始化
     sleep(5);
 
-    auto libart = dlopen("libart.so", RTLD_NOW);
-    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
-                                                                             "JNI_GetCreatedJavaVMs");
+    // Android 10+: libart lives in the ART APEX namespace, so plain dlopen() from here fails.
+    // xdl walks the already-loaded modules instead.
+    auto libart = xdl_open("libart.so", XDL_DEFAULT);
+    auto JNI_GetCreatedJavaVMs = libart ? (jint (*)(JavaVM **, jsize, jsize *)) xdl_sym(libart,
+                                                                             "JNI_GetCreatedJavaVMs", nullptr) : nullptr;
     LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
+    if (!JNI_GetCreatedJavaVMs) {
+        LOGE("JNI_GetCreatedJavaVMs not found");
+        return false;
+    }
     JavaVM *vms_buf[1];
     JavaVM *vms;
     jsize num_vms;
@@ -141,15 +147,16 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
         return false;
     }
 
-    auto nb = dlopen("libhoudini.so", RTLD_NOW);
-    if (!nb) {
-        auto native_bridge = GetNativeBridgeLibrary();
-        LOGI("native bridge: %s", native_bridge.data());
-        nb = dlopen(native_bridge.data(), RTLD_NOW);
+    void *nb = nullptr;
+    auto native_bridge = GetNativeBridgeLibrary();
+    LOGI("native bridge: %s", native_bridge.data());
+    for (const char *name : {"libhoudini.so", native_bridge.data()}) {
+        auto h = xdl_open(name, XDL_TRY_FORCE_LOAD);
+        if (h && xdl_sym(h, "NativeBridgeItf", nullptr)) { nb = h; LOGI("using %s", name); break; }
     }
     if (nb) {
         LOGI("nb %p", nb);
-        auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
+        auto callbacks = (NativeBridgeCallbacks *) xdl_sym(nb, "NativeBridgeItf", nullptr);
         if (callbacks) {
             LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
             LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
