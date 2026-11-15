@@ -16,6 +16,90 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <vector>
+#include <algorithm>
+#include <fcntl.h>
+
+// ---- decrypted global-metadata.dat save (Digimon-NC) ------------------------------------------
+// The game decrypts global-metadata.dat into RAM during il2cpp_init. Scan our own readable mappings
+// through /proc/self/mem (pread fails cleanly on unbacked pages, so nothing can fault), validate the
+// IL2CPP header the same way Tools/il2cpp/carve_metadata.py does, and write each valid blob to
+// <files>/metadata_<address>.bin for the offline carver to verify and pick.
+static uint32_t md_header_length(const uint8_t *h, size_t avail) {
+    if (avail < 12 || *(const uint32_t *) h != 0xFAB11BAFu) return 0;
+    int32_t version = *(const int32_t *) (h + 4);
+    if (version < 16 || version > 40) return 0;
+    int32_t hb = *(const int32_t *) (h + 8);
+    if (hb < 0x40 || hb > 0x400 || (hb - 8) % 8 != 0 || (size_t) hb > avail) return 0;
+    int64_t length = 0;
+    const int64_t max_bytes = 512LL * 1024 * 1024;
+    for (int i = 0; i < (hb - 8) / 8; i++) {
+        int32_t o = *(const int32_t *) (h + 8 + i * 8);
+        int32_t sz = *(const int32_t *) (h + 12 + i * 8);
+        if (o < 0 || sz < 0 || sz > max_bytes) return 0;
+        if (sz && o < hb) return 0;
+        if ((int64_t) o + sz > max_bytes) return 0;
+        if ((int64_t) o + sz > length) length = (int64_t) o + sz;
+    }
+    if (length < hb) return 0;
+    return (uint32_t) length;
+}
+
+static void dump_metadata(const char *game_data_dir) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    int mem = open("/proc/self/mem", O_RDONLY);
+    if (!maps || mem < 0) {
+        LOGE("metadata: cannot open maps/mem");
+        if (maps) fclose(maps);
+        if (mem >= 0) close(mem);
+        return;
+    }
+    const size_t CHUNK = 16 * 1024 * 1024;
+    std::vector<uint8_t> buf(CHUNK);
+    std::vector<uint8_t> hdr(0x400);
+    char line[1024];
+    int written = 0;
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long start, end;
+        char perms[5] = {0};
+        char path[512] = {0};
+        if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %511[^\n]", &start, &end, perms, path) < 3) continue;
+        if (perms[0] != 'r') continue;
+        if (strncmp(path, "/dev/", 5) == 0 && strncmp(path, "/dev/ashmem", 11) != 0) continue;
+        if (strcmp(path, "[vvar]") == 0 || strcmp(path, "[vsyscall]") == 0) continue;
+        for (unsigned long base = start; base < end; base += CHUNK) {
+            size_t want = std::min((unsigned long) CHUNK, end - base);
+            ssize_t n = pread64(mem, buf.data(), want, (off64_t) base);
+            if (n <= 12) continue;
+            for (size_t i = 0; i + 12 <= (size_t) n; i += 4) {
+                if (*(const uint32_t *) (buf.data() + i) != 0xFAB11BAFu) continue;
+                unsigned long addr = base + i;
+                ssize_t hn = pread64(mem, hdr.data(), hdr.size(), (off64_t) addr);
+                if (hn <= 12) continue;
+                uint32_t length = md_header_length(hdr.data(), (size_t) hn);
+                if (!length) continue;
+                std::vector<uint8_t> blob(length);
+                if (pread64(mem, blob.data(), length, (off64_t) addr) != (ssize_t) length) {
+                    LOGW("metadata: candidate at %lx (%u bytes) not fully readable", addr, length);
+                    continue;
+                }
+                char out[PATH_MAX];
+                snprintf(out, sizeof(out), "%s/files/metadata_%lx.bin", game_data_dir, addr);
+                FILE *f = fopen(out, "wb");
+                if (f) {
+                    fwrite(blob.data(), 1, length, f);
+                    fclose(f);
+                    written++;
+                    LOGI("metadata: v%d %u bytes at %lx -> %s", *(int32_t *) (hdr.data() + 4), length, addr, out);
+                }
+            }
+        }
+    }
+    fclose(maps);
+    close(mem);
+    LOGI("metadata: %d candidate(s) written", written);
+}
+// -----------------------------------------------------------------------------------------------
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
@@ -25,6 +109,7 @@ void hack_start(const char *game_data_dir) {
             load = true;
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
+            dump_metadata(game_data_dir);
             break;
         } else {
             sleep(1);
