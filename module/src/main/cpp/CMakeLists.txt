@@ -33,10 +33,16 @@ include_directories(
 
 aux_source_directory(xdl xdl-src)
 
+# method-entry trace experiment (Digimon-NC, goal item 2): an inline hook on ARM64 code, the only ABI it hooks
+if (ANDROID_ABI STREQUAL "arm64-v8a" OR CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+    set(hook-src a64hook/And64InlineHook.cpp)
+endif ()
+
 add_library(${MODULE_NAME} SHARED
         main.cpp
         hack.cpp
         il2cpp_dump.cpp
+        ${hook-src}
         ${xdl-src})
 target_link_libraries(${MODULE_NAME} log)
 

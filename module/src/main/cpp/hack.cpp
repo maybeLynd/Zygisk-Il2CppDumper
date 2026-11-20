@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <jni.h>
 #include <thread>
+#include <string>
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
@@ -75,6 +76,73 @@ static void dump_metadata(const char *game_data_dir, void *il2cpp_handle) {
     LOGE("metadata: no anchor string");
     write_status(game_data_dir, "error no-anchor\n");
 }
+// ---- method-entry trace experiment (Digimon-NC, goal item 2, step 1) ---------------------------------
+// MuMu runs the game's ARM code through houdini. Whether an inline hook on translated ARM code is ever reached
+// is unproven, so this hooks one method Unity calls every frame once Lua runs (LuaUpdater.LateUpdate) and
+// writes its hit count to files/trace_status.txt every 5 s for 2 minutes. Hits that rise = hooks work.
+#if defined(__aarch64__)
+#include "a64hook/And64InlineHook.hpp"
+#include <atomic>
+static std::atomic<unsigned long> g_trace_hits{0};
+static void (*g_trace_orig)(void *, void *) = nullptr;
+static void trace_hooked(void *self, void *method) {
+    g_trace_hits.fetch_add(1, std::memory_order_relaxed);
+    g_trace_orig(self, method);
+}
+
+static void trace_status(const char *game_data_dir, const char *text) {
+    char out[PATH_MAX];
+    snprintf(out, sizeof(out), "%s/files/trace_status.txt", game_data_dir);
+    FILE *f = fopen(out, "w");
+    if (f) {
+        fputs(text, f);
+        fclose(f);
+    }
+}
+
+static void trace_experiment(const char *game_data_dir, void *il2cpp_handle) {
+    typedef void *(*domain_get_t)();
+    typedef void **(*domain_get_assemblies_t)(void *, size_t *);
+    typedef void *(*assembly_get_image_t)(void *);
+    typedef void *(*class_from_name_t)(void *, const char *, const char *);
+    typedef void *(*class_get_method_t)(void *, const char *, int);
+    auto domain_get = (domain_get_t) xdl_sym(il2cpp_handle, "il2cpp_domain_get", nullptr);
+    auto get_assemblies = (domain_get_assemblies_t) xdl_sym(il2cpp_handle, "il2cpp_domain_get_assemblies", nullptr);
+    auto get_image = (assembly_get_image_t) xdl_sym(il2cpp_handle, "il2cpp_assembly_get_image", nullptr);
+    auto from_name = (class_from_name_t) xdl_sym(il2cpp_handle, "il2cpp_class_from_name", nullptr);
+    auto get_method = (class_get_method_t) xdl_sym(il2cpp_handle, "il2cpp_class_get_method_from_name", nullptr);
+    if (!domain_get || !get_assemblies || !get_image || !from_name || !get_method) {
+        trace_status(game_data_dir, "error api-missing\n");
+        return;
+    }
+    size_t n = 0;
+    void **assemblies = get_assemblies(domain_get(), &n);
+    void *method = nullptr;
+    for (size_t a = 0; a < n && !method; a++) {
+        void *klass = from_name(get_image(assemblies[a]), "", "LuaUpdater");
+        if (klass) method = get_method(klass, "LateUpdate", 0);
+    }
+    if (!method) {
+        trace_status(game_data_dir, "error no-method LuaUpdater.LateUpdate\n");
+        return;
+    }
+    void *target = *(void **) method;  // MethodInfo.methodPointer is its first field
+    A64HookFunction(target, (void *) trace_hooked, (void **) &g_trace_orig);
+    if (!g_trace_orig) {
+        trace_status(game_data_dir, "error hook-failed\n");
+        return;
+    }
+    std::thread([dir = std::string(game_data_dir), target]() {
+        for (int i = 0; i < 24; i++) {
+            char s[128];
+            snprintf(s, sizeof(s), "hooked %lx t %d hits %lu\n", (unsigned long) (uintptr_t) target, i * 5,
+                     g_trace_hits.load());
+            trace_status(dir.c_str(), s);
+            sleep(5);
+        }
+    }).detach();
+}
+#endif
 // -----------------------------------------------------------------------------------------------
 
 void hack_start(const char *game_data_dir) {
@@ -88,6 +156,9 @@ void hack_start(const char *game_data_dir) {
             il2cpp_dump(game_data_dir);
             write_status(game_data_dir, "metadata\n");
             dump_metadata(game_data_dir, handle);
+#if defined(__aarch64__)
+            trace_experiment(game_data_dir, handle);
+#endif
             break;
         } else {
             sleep(1);
